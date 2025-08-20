@@ -549,8 +549,6 @@ export default function App() {
   const addToCart = () => {
     if (!selectedBurger) return alert("Select a burger/item first.");
 
-    const extrasTotal = selectedExtras.reduce((s, e) => s + e.price, 0);
-
     // Combine consumption map for this cart line from product + extras
     const uses = {};
     const prodUses = selectedBurger.uses || {};
@@ -2605,3 +2603,4 @@ const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
     </div>
   );
 }
+

@@ -1,6 +1,222 @@
 import React, { useEffect, useMemo, useState } from "react";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
+
+/* --------------------------- FIREBASE SETUP --------------------------- */
+import { initializeApp, getApps } from "firebase/app";
+import {
+  getAuth,
+  onAuthStateChanged,
+  signInAnonymously,
+} from "firebase/auth";
+import {
+  getFirestore,
+  serverTimestamp,
+  Timestamp,
+  collection,
+  addDoc,
+  updateDoc,
+  getDoc,
+  setDoc,
+  getDocs,
+  onSnapshot,
+  query,
+  orderBy,
+  where,
+  doc as fsDoc,
+} from "firebase/firestore";
+
+// 1) Fill these with your project’s values from the Firebase console
+const FIREBASE_CONFIG = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT.firebaseapp.com",
+  projectId: "YOUR_PROJECT_ID",
+  storageBucket: "YOUR_PROJECT.appspot.com",
+  messagingSenderId: "YOUR_SENDER_ID",
+  appId: "YOUR_APP_ID",
+};
+
+// 2) Name your shop (used for collection/doc paths)
+const SHOP_ID = "tux"; // change if you manage multiple shops (e.g. "tux-truck-1")
+
+function ensureFirebase() {
+  if (!getApps().length) initializeApp(FIREBASE_CONFIG);
+  const auth = getAuth();
+  const db = getFirestore();
+  return { auth, db };
+}
+
+// Pack current state (dates -> ISO) for Firestore
+function packStateForCloud(state) {
+  const {
+    menu,
+    extraList,
+    orders,
+    inventory,
+    nextOrderNo,
+    dark,
+    workers,
+    paymentMethods,
+    inventoryLocked,
+    inventorySnapshot,
+    inventoryLockedAt,
+    adminPins,
+    orderTypes,
+    defaultDeliveryFee,
+    expenses,
+    dayMeta,
+    bankTx,
+  } = state;
+
+  return {
+    version: 1,
+    updatedAt: serverTimestamp(),
+    menu,
+    extras: extraList,
+    orders: (orders || []).map((o) => ({
+      ...o,
+      date: o.date ? o.date.toISOString() : null,
+      restockedAt: o.restockedAt ? o.restockedAt.toISOString() : null,
+    })),
+    inventory,
+    nextOrderNo,
+    dark,
+    workers,
+    paymentMethods,
+    inventoryLocked,
+    inventorySnapshot,
+    inventoryLockedAt: inventoryLockedAt ? new Date(inventoryLockedAt).toISOString() : null,
+    adminPins,
+    orderTypes,
+    defaultDeliveryFee,
+    expenses: (expenses || []).map((e) => ({
+      ...e,
+      date: e.date ? e.date.toISOString() : null,
+    })),
+    dayMeta: dayMeta
+      ? {
+          ...dayMeta,
+          startedAt: dayMeta.startedAt ? dayMeta.startedAt.toISOString() : null,
+          endedAt: dayMeta.endedAt ? dayMeta.endedAt.toISOString() : null,
+          lastReportAt: dayMeta.lastReportAt ? dayMeta.lastReportAt.toISOString() : null,
+          resetAt: dayMeta.resetAt ? dayMeta.resetAt.toISOString() : null,
+          shiftChanges: Array.isArray(dayMeta.shiftChanges)
+            ? dayMeta.shiftChanges.map((c) => ({
+                ...c,
+                at: c?.at ? new Date(c.at).toISOString() : null,
+              }))
+            : [],
+        }
+      : {},
+    bankTx: (bankTx || []).map((t) => ({
+      ...t,
+      date: t.date ? t.date.toISOString() : null,
+    })),
+  };
+}
+
+// Unpack from Firestore (ISO -> Date)
+function unpackStateFromCloud(data, fallbackDayMeta = {}) {
+  const out = {};
+  if (Array.isArray(data.orders)) {
+    out.orders = data.orders.map((o) => ({
+      ...o,
+      date: o.date ? new Date(o.date) : new Date(),
+      restockedAt: o.restockedAt ? new Date(o.restockedAt) : undefined,
+    }));
+  }
+  if (Array.isArray(data.expenses)) {
+    out.expenses = data.expenses.map((e) => ({
+      ...e,
+      date: e.date ? new Date(e.date) : new Date(),
+    }));
+  }
+  if (Array.isArray(data.bankTx)) {
+    out.bankTx = data.bankTx.map((t) => ({
+      ...t,
+      date: t.date ? new Date(t.date) : new Date(),
+    }));
+  }
+  if (data.inventoryLockedAt) out.inventoryLockedAt = new Date(data.inventoryLockedAt);
+
+  if (data.dayMeta) {
+    out.dayMeta = {
+      startedBy: data.dayMeta.startedBy || "",
+      startedAt: data.dayMeta.startedAt ? new Date(data.dayMeta.startedAt) : null,
+      endedAt: data.dayMeta.endedAt ? new Date(data.dayMeta.endedAt) : null,
+      endedBy: data.dayMeta.endedBy || "",
+      lastReportAt: data.dayMeta.lastReportAt ? new Date(data.dayMeta.lastReportAt) : null,
+      resetBy: data.dayMeta.resetBy || "",
+      resetAt: data.dayMeta.resetAt ? new Date(data.dayMeta.resetAt) : null,
+      shiftChanges: Array.isArray(data.dayMeta.shiftChanges)
+        ? data.dayMeta.shiftChanges.map((c) => ({ ...c, at: c.at ? new Date(c.at) : null }))
+        : [],
+    };
+  } else {
+    out.dayMeta = fallbackDayMeta;
+  }
+
+  // easy fields
+  if (data.menu) out.menu = data.menu;
+  if (data.extras) out.extraList = data.extras;
+  if (data.inventory) out.inventory = data.inventory;
+  if (typeof data.nextOrderNo === "number") out.nextOrderNo = data.nextOrderNo;
+  if (typeof data.dark === "boolean") out.dark = data.dark;
+  if (Array.isArray(data.workers)) out.workers = data.workers;
+  if (Array.isArray(data.paymentMethods)) out.paymentMethods = data.paymentMethods;
+  if (typeof data.inventoryLocked === "boolean") out.inventoryLocked = data.inventoryLocked;
+  if (Array.isArray(data.inventorySnapshot)) out.inventorySnapshot = data.inventorySnapshot;
+  if (data.adminPins) out.adminPins = data.adminPins;
+  if (Array.isArray(data.orderTypes)) out.orderTypes = data.orderTypes;
+  if (typeof data.defaultDeliveryFee === "number") out.defaultDeliveryFee = data.defaultDeliveryFee;
+
+  return out;
+}
+
+// Normalize a single order for Firestore orders collection
+function normalizeOrderForCloud(order) {
+  return {
+    orderNo: order.orderNo,
+    worker: order.worker,
+    payment: order.payment,
+    orderType: order.orderType,
+    deliveryFee: order.deliveryFee,
+    total: order.total,
+    itemsTotal: order.itemsTotal,
+    done: !!order.done,
+    voided: !!order.voided,
+    note: order.note || "",
+    date: order.date ? order.date.toISOString() : new Date().toISOString(),
+    restockedAt: order.restockedAt ? order.restockedAt.toISOString() : null,
+    cart: order.cart || [],
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+}
+
+// Convert Firestore doc to local order shape
+function orderFromCloudDoc(id, d) {
+  const asDate = (v) =>
+    v instanceof Timestamp ? v.toDate() : v ? new Date(v) : new Date();
+  return {
+    cloudId: id,
+    orderNo: d.orderNo,
+    worker: d.worker,
+    payment: d.payment,
+    orderType: d.orderType,
+    deliveryFee: Number(d.deliveryFee || 0),
+    total: Number(d.total || 0),
+    itemsTotal: Number(d.itemsTotal || 0),
+    done: !!d.done,
+    voided: !!d.voided,
+    note: d.note || "",
+    date: asDate(d.date || d.createdAt),
+    restockedAt: d.restockedAt ? asDate(d.restockedAt) : undefined,
+    cart: Array.isArray(d.cart) ? d.cart : [],
+  };
+}
+
+/* --------------------------- HELPERS --------------------------- */
 // Load a file from /public as a Data URL for jsPDF
 async function loadAsDataURL(path) {
   const res = await fetch(path);
@@ -12,21 +228,16 @@ async function loadAsDataURL(path) {
   });
 }
 
-
-// --------------------------- BASE DATA ---------------------------
+/* --------------------------- BASE DATA --------------------------- */
 const BASE_MENU = [
   { id: 1, name: "Single Smashed Patty", price: 95, uses: {} },
   { id: 2, name: "Double Smashed Patty", price: 140, uses: {} },
   { id: 3, name: "Triple Smashed Patty", price: 160, uses: {} },
   { id: 4, name: "Tux Quatro Smashed Patty", price: 190, uses: {} },
-
-  // TUXIFY line
   { id: 14, name: "TUXIFY Single", price: 120, uses: {} },
   { id: 15, name: "TUXIFY Double", price: 160, uses: {} },
   { id: 16, name: "TUXIFY Triple", price: 200, uses: {} },
   { id: 17, name: "TUXIFY Quatro", price: 240, uses: {} },
-
-  // Sides & drinks
   { id: 5, name: "Classic Fries", price: 25, uses: {} },
   { id: 6, name: "Cheese Fries", price: 40, uses: {} },
   { id: 7, name: "Chili Fries", price: 50, uses: {} },
@@ -37,7 +248,6 @@ const BASE_MENU = [
   { id: 12, name: "Soda", price: 20, uses: {} },
   { id: 13, name: "Water", price: 10, uses: {} },
 ];
-
 const BASE_EXTRAS = [
   { id: 101, name: "Extra Smashed Patty", price: 40, uses: {} },
   { id: 102, name: "Bacon", price: 20, uses: {} },
@@ -53,21 +263,17 @@ const BASE_EXTRAS = [
   { id: 112, name: "Mozzarella Cheese", price: 20, uses: {} },
   { id: 113, name: "Tux Hawawshi Sauce", price: 10, uses: {} },
 ];
-
 // Default inventory items
 const DEFAULT_INVENTORY = [
   { id: "meat", name: "Meat", unit: "g", qty: 0 },
   { id: "cheese", name: "Cheese", unit: "slices", qty: 0 },
 ];
-
 // Initial workers & payments (editable in UI)
 const BASE_WORKERS = ["Hassan", "Warda", "Ahmed"];
 const DEFAULT_PAYMENT_METHODS = ["Cash", "Card", "Instapay"];
-
 // Dine options (editable in Prices)
 const DEFAULT_ORDER_TYPES = ["Take-Away", "Dine-in", "Delivery"];
 const DEFAULT_DELIVERY_FEE = 20;
-
 // ---- Editor PIN to protect PRICES tab
 const EDITOR_PIN = "0512";
 
@@ -84,28 +290,16 @@ const LS_KEYS = {
   invLock: "tux_inventoryLocked",
   invSnap: "tux_inventorySnapshot",
   invLockedAt: "tux_inventoryLockedAt",
-
   adminPins: "tux_adminPins_v1",
-
   orderTypes: "tux_orderTypes_v1",
   defaultDeliveryFee: "tux_defaultDeliveryFee_v1",
-
   expenses: "tux_expenses_v1",
-
   dayMeta: "tux_dayMeta_v1",
-
   bankTx: "tux_bankTx_v1",
 };
 
 // ---------- PIN defaults + helpers ----------
-const DEFAULT_ADMIN_PINS = {
-  1: "1111",
-  2: "2222",
-  3: "3333",
-  4: "4444",
-  5: "5555",
-  6: "6666",
-};
+const DEFAULT_ADMIN_PINS = { 1: "1111", 2: "2222", 3: "3333", 4: "4444", 5: "5555", 6: "6666" };
 const norm = (v) => String(v ?? "").trim();
 
 export default function App() {
@@ -161,7 +355,7 @@ export default function App() {
   const [nextOrderNo, setNextOrderNo] = useState(1);
 
   // Expenses
-  const [expenses, setExpenses] = useState([]); // {id, name, unit, qty, unitPrice, date, note}
+  const [expenses, setExpenses] = useState([]);
   const [newExpName, setNewExpName] = useState("");
   const [newExpUnit, setNewExpUnit] = useState("pcs");
   const [newExpQty, setNewExpQty] = useState(1);
@@ -170,19 +364,19 @@ export default function App() {
 
   // Bank (admin pin protected)
   const [bankUnlocked, setBankUnlocked] = useState(false);
-  const [bankTx, setBankTx] = useState([]); // {id, type:'deposit'|'withdraw'|'init'|'adjustUp'|'adjustDown', amount, date, worker, note}
+  const [bankTx, setBankTx] = useState([]);
   const [bankForm, setBankForm] = useState({ type: "deposit", amount: 0, worker: "", note: "" });
 
   // Shift/day meta
   const [dayMeta, setDayMeta] = useState({
     startedBy: "",
     startedAt: null,
-    endedAt: null,          // end-of-day time
-    endedBy: "",            // who ended the day
+    endedAt: null,
+    endedBy: "",
     lastReportAt: null,
     resetBy: "",
     resetAt: null,
-    shiftChanges: [],       // [{at: Date, from: string, to: string}]
+    shiftChanges: [],
   });
 
   // Reports sorting
@@ -195,164 +389,124 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
-  // ---------- Prices tab: local editors for adding items & editing consumption ----------
-  const [usesEditOpenMenu, setUsesEditOpenMenu] = useState({});   // { [menuId]: true }
-  const [usesEditOpenExtra, setUsesEditOpenExtra] = useState({});  // { [extraId]: true }
+  // ---------- Prices tab local editors ----------
+  const [usesEditOpenMenu, setUsesEditOpenMenu] = useState({});
+  const [usesEditOpenExtra, setUsesEditOpenExtra] = useState({});
   const [newMenuName, setNewMenuName] = useState("");
   const [newMenuPrice, setNewMenuPrice] = useState(0);
   const [newExtraName, setNewExtraName] = useState("");
   const [newExtraPrice, setNewExtraPrice] = useState(0);
 
-  // ---------------- Persistence: load once ----------------
+  /* --------------------------- FIREBASE STATE --------------------------- */
+  const [fbReady, setFbReady] = useState(false);
+  const [fbUser, setFbUser] = useState(null);
+  const [cloudEnabled, setCloudEnabled] = useState(true); // autosave to state doc
+  const [realtimeOrders, setRealtimeOrders] = useState(false); // live board via orders collection
+  const [cloudStatus, setCloudStatus] = useState({ lastSaveAt: null, lastLoadAt: null, error: null });
+
+  // Init + Anonymous Auth
   useEffect(() => {
     try {
-      const savedMenu = JSON.parse(localStorage.getItem(LS_KEYS.menu) || "null");
-      const savedExtras = JSON.parse(localStorage.getItem(LS_KEYS.extras) || "null");
-      const savedOrders = JSON.parse(localStorage.getItem(LS_KEYS.orders) || "null");
-      const savedInvArr = JSON.parse(localStorage.getItem(LS_KEYS.inv) || "null");
-      const legacyInvObj = JSON.parse(localStorage.getItem("tux_inventory") || "null"); // migration
-      const savedNo = JSON.parse(localStorage.getItem(LS_KEYS.nextNo) || "null");
-      const savedDark = JSON.parse(localStorage.getItem(LS_KEYS.dark) || "false");
-      const savedWorkers = JSON.parse(localStorage.getItem(LS_KEYS.workers) || "null");
-      const savedPays = JSON.parse(localStorage.getItem(LS_KEYS.pays) || "null");
-
-      const savedInvLocked = JSON.parse(localStorage.getItem(LS_KEYS.invLock) || "false");
-      const savedInvSnap = JSON.parse(localStorage.getItem(LS_KEYS.invSnap) || "null");
-      const savedInvLockedAt = JSON.parse(localStorage.getItem(LS_KEYS.invLockedAt) || "null");
-
-      const savedAdminPins = JSON.parse(localStorage.getItem(LS_KEYS.adminPins) || "null");
-
-      const savedOrderTypes = JSON.parse(localStorage.getItem(LS_KEYS.orderTypes) || "null");
-      const savedDefDelFee = JSON.parse(localStorage.getItem(LS_KEYS.defaultDeliveryFee) || "null");
-
-      const savedExpenses = JSON.parse(localStorage.getItem(LS_KEYS.expenses) || "null");
-
-      const savedDayMeta = JSON.parse(localStorage.getItem(LS_KEYS.dayMeta) || "null");
-
-      const savedBankTx = JSON.parse(localStorage.getItem(LS_KEYS.bankTx) || "null");
-
-      if (savedMenu) setMenu(savedMenu);
-      if (savedExtras) setExtraList(savedExtras);
-      if (savedOrders)
-        setOrders(
-          savedOrders.map((o) => ({
-            ...o,
-            date: new Date(o.date),
-            restockedAt: o.restockedAt ? new Date(o.restockedAt) : undefined,
-          }))
-        );
-
-      // Inventory migration/restore
-      if (Array.isArray(savedInvArr) && savedInvArr.length) {
-        setInventory(savedInvArr);
-      } else if (legacyInvObj && typeof legacyInvObj === "object") {
-        const arr = [
-          { id: "meat", name: "Meat", unit: "g", qty: legacyInvObj.meat ?? 0 },
-          { id: "cheese", name: "Cheese", unit: "slices", qty: legacyInvObj.cheese ?? 0 },
-        ];
-        setInventory(arr);
-      }
-
-      if (savedNo) setNextOrderNo(savedNo);
-      setDark(!!savedDark);
-      if (savedWorkers && Array.isArray(savedWorkers) && savedWorkers.length) setWorkers(savedWorkers);
-      if (savedPays && Array.isArray(savedPays) && savedPays.length) setPaymentMethods(savedPays);
-
-      setInventoryLocked(!!savedInvLocked);
-      if (Array.isArray(savedInvSnap)) setInventorySnapshot(savedInvSnap);
-      if (savedInvLockedAt) setInventoryLockedAt(savedInvLockedAt ? new Date(savedInvLockedAt) : null);
-
-      if (savedAdminPins && typeof savedAdminPins === "object") {
-        const merged = { ...DEFAULT_ADMIN_PINS };
-        for (const k of Object.keys(DEFAULT_ADMIN_PINS)) {
-          merged[k] = norm(savedAdminPins[k] ?? merged[k]);
+      const { auth } = ensureFirebase();
+      setFbReady(true);
+      const unsub = onAuthStateChanged(auth, async (u) => {
+        if (!u) {
+          try {
+            await signInAnonymously(auth);
+          } catch (e) {
+            setCloudStatus((s) => ({ ...s, error: String(e) }));
+          }
+        } else {
+          setFbUser(u);
         }
-        merged[4] = "4444";
-        merged[5] = "5555";
-        merged[6] = "6666";
-        setAdminPins(merged);
-      } else {
-        setAdminPins({ ...DEFAULT_ADMIN_PINS, 4: "4444", 5: "5555", 6: "6666" });
-      }
-
-      if (Array.isArray(savedOrderTypes) && savedOrderTypes.length) setOrderTypes(savedOrderTypes);
-      if (typeof savedDefDelFee === "number") setDefaultDeliveryFee(savedDefDelFee);
-
-      if (Array.isArray(savedExpenses)) {
-        const mapped = savedExpenses.map((e) => ({ ...e, date: e.date ? new Date(e.date) : new Date() }));
-        setExpenses(mapped);
-      }
-
-      if (savedDayMeta && typeof savedDayMeta === "object") {
-        setDayMeta({
-          startedBy: savedDayMeta.startedBy || "",
-          startedAt: savedDayMeta.startedAt ? new Date(savedDayMeta.startedAt) : null,
-          endedAt: savedDayMeta.endedAt ? new Date(savedDayMeta.endedAt) : null,
-          endedBy: savedDayMeta.endedBy || "",
-          lastReportAt: savedDayMeta.lastReportAt ? new Date(savedDayMeta.lastReportAt) : null,
-          resetBy: savedDayMeta.resetBy || "",
-          resetAt: savedDayMeta.resetAt ? new Date(savedDayMeta.resetAt) : null,
-          shiftChanges: Array.isArray(savedDayMeta.shiftChanges)
-            ? savedDayMeta.shiftChanges.map((c) => ({ ...c, at: c.at ? new Date(c.at) : null }))
-            : [],
-        });
-      }
-
-      if (Array.isArray(savedBankTx)) {
-        const mapped = savedBankTx.map((t) => ({ ...t, date: t.date ? new Date(t.date) : new Date() }));
-        setBankTx(mapped);
-      }
+      });
+      return () => unsub();
     } catch (e) {
-      console.warn("Load persistence error", e);
+      setCloudStatus((s) => ({ ...s, error: String(e) }));
     }
   }, []);
 
-  // ---------------- Persistence: save on change ----------------
+  // Firestore refs
+  const db = useMemo(() => (fbReady ? ensureFirebase().db : null), [fbReady]);
+  const stateDocRef = useMemo(
+    () => (db ? fsDoc(db, "shops", SHOP_ID, "state", "pos") : null),
+    [db]
+  );
+  const ordersColRef = useMemo(
+    () => (db ? collection(db, "shops", SHOP_ID, "orders") : null),
+    [db]
+  );
+
+  // Manual cloud load (pull)
+  const loadFromCloud = async () => {
+    if (!stateDocRef || !fbUser) return alert("Firebase not ready.");
+    try {
+      const snap = await getDoc(stateDocRef);
+      if (!snap.exists()) return alert("No cloud state yet to load.");
+      const data = snap.data() || {};
+      const unpacked = unpackStateFromCloud(data, dayMeta);
+      if (unpacked.menu) setMenu(unpacked.menu);
+      if (unpacked.extraList) setExtraList(unpacked.extraList);
+      if (unpacked.orders) setOrders(unpacked.orders);
+      if (unpacked.inventory) setInventory(unpacked.inventory);
+      if (unpacked.nextOrderNo != null) setNextOrderNo(unpacked.nextOrderNo);
+      if (unpacked.dark != null) setDark(unpacked.dark);
+      if (unpacked.workers) setWorkers(unpacked.workers);
+      if (unpacked.paymentMethods) setPaymentMethods(unpacked.paymentMethods);
+      if (unpacked.inventoryLocked != null) setInventoryLocked(unpacked.inventoryLocked);
+      if (unpacked.inventorySnapshot) setInventorySnapshot(unpacked.inventorySnapshot);
+      if (unpacked.inventoryLockedAt != null) setInventoryLockedAt(unpacked.inventoryLockedAt);
+      if (unpacked.adminPins) setAdminPins({ ...DEFAULT_ADMIN_PINS, ...unpacked.adminPins });
+      if (unpacked.orderTypes) setOrderTypes(unpacked.orderTypes);
+      if (unpacked.defaultDeliveryFee != null) setDefaultDeliveryFee(unpacked.defaultDeliveryFee);
+      if (unpacked.expenses) setExpenses(unpacked.expenses);
+      if (unpacked.dayMeta) setDayMeta(unpacked.dayMeta);
+      if (unpacked.bankTx) setBankTx(unpacked.bankTx);
+
+      setCloudStatus((s) => ({ ...s, lastLoadAt: new Date(), error: null }));
+      alert("Loaded from cloud ✔");
+    } catch (e) {
+      setCloudStatus((s) => ({ ...s, error: String(e) }));
+      alert("Cloud load failed: " + e);
+    }
+  };
+
+  // Autosave to cloud (state doc) — debounced
   useEffect(() => {
-    const save = () => {
+    if (!cloudEnabled || !stateDocRef || !fbUser) return;
+    const t = setTimeout(async () => {
       try {
-        localStorage.setItem(LS_KEYS.menu, JSON.stringify(menu));
-        localStorage.setItem(LS_KEYS.extras, JSON.stringify(extraList));
-        localStorage.setItem(LS_KEYS.orders, JSON.stringify(orders));
-        localStorage.setItem(LS_KEYS.inv, JSON.stringify(inventory));
-        localStorage.setItem(LS_KEYS.nextNo, JSON.stringify(nextOrderNo));
-        localStorage.setItem(LS_KEYS.dark, JSON.stringify(dark));
-        localStorage.setItem(LS_KEYS.workers, JSON.stringify(workers));
-        localStorage.setItem(LS_KEYS.pays, JSON.stringify(paymentMethods));
-        localStorage.setItem(LS_KEYS.invLock, JSON.stringify(inventoryLocked));
-        localStorage.setItem(LS_KEYS.invSnap, JSON.stringify(inventorySnapshot));
-        localStorage.setItem(LS_KEYS.invLockedAt, JSON.stringify(inventoryLockedAt));
-        localStorage.setItem(LS_KEYS.adminPins, JSON.stringify(adminPins));
-
-        localStorage.setItem(LS_KEYS.orderTypes, JSON.stringify(orderTypes));
-        localStorage.setItem(LS_KEYS.defaultDeliveryFee, JSON.stringify(defaultDeliveryFee));
-
-        localStorage.setItem(LS_KEYS.expenses, JSON.stringify(expenses));
-        localStorage.setItem(
-          LS_KEYS.dayMeta,
-          JSON.stringify({
-            ...dayMeta,
-            startedAt: dayMeta.startedAt ? dayMeta.startedAt.toISOString() : null,
-            endedAt: dayMeta.endedAt ? dayMeta.endedAt.toISOString() : null,
-            lastReportAt: dayMeta.lastReportAt ? dayMeta.lastReportAt.toISOString() : null,
-            resetAt: dayMeta.resetAt ? dayMeta.resetAt.toISOString() : null,
-            shiftChanges: Array.isArray(dayMeta.shiftChanges)
-              ? dayMeta.shiftChanges.map((c) => ({ ...c, at: c.at ? new Date(c.at).toISOString() : null }))
-              : [],
-          })
-        );
-
-        localStorage.setItem(
-          LS_KEYS.bankTx,
-          JSON.stringify(bankTx.map((t) => ({ ...t, date: t.date ? t.date.toISOString() : new Date().toISOString() })))
-        );
+        const body = packStateForCloud({
+          menu,
+          extraList,
+          orders,
+          inventory,
+          nextOrderNo,
+          dark,
+          workers,
+          paymentMethods,
+          inventoryLocked,
+          inventorySnapshot,
+          inventoryLockedAt,
+          adminPins,
+          orderTypes,
+          defaultDeliveryFee,
+          expenses,
+          dayMeta,
+          bankTx,
+        });
+        await setDoc(stateDocRef, body, { merge: true });
+        setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(), error: null }));
       } catch (e) {
-        console.warn("Save persistence error", e);
+        setCloudStatus((s) => ({ ...s, error: String(e) }));
       }
-    };
-    const id = setInterval(save, 1500);
-    return () => clearInterval(id);
+    }, 1600);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
+    cloudEnabled,
+    stateDocRef,
+    fbUser,
     menu,
     extraList,
     orders,
@@ -372,7 +526,20 @@ export default function App() {
     bankTx,
   ]);
 
-  // Helpers
+  // Optional: realtime orders stream
+  useEffect(() => {
+    if (!realtimeOrders || !ordersColRef || !fbUser) return;
+    const qy = query(ordersColRef, orderBy("createdAt", "desc"));
+    const unsub = onSnapshot(qy, (snap) => {
+      const arr = [];
+      snap.forEach((d) => arr.push(orderFromCloudDoc(d.id, d.data())));
+      // Replace local orders with cloud stream (you can merge if you prefer)
+      setOrders(arr);
+    });
+    return () => unsub();
+  }, [realtimeOrders, ordersColRef, fbUser]);
+
+  /* --------------------------- EXISTING APP LOGIC --------------------------- */
   const toggleExtra = (extra) => {
     setSelectedExtras((prev) =>
       prev.find((e) => e.id === extra.id)
@@ -473,12 +640,11 @@ export default function App() {
     }
     if (txs.length) setBankTx((arr) => [...txs, ...arr]);
 
-    // Reset "whole day"
+    // Reset day locally
     setOrders([]);
     setNextOrderNo(1);
     setInventoryLocked(false);
     setInventoryLockedAt(null);
-    // Keep snapshot for reference if you wish; we keep it as-is.
 
     setDayMeta({
       startedBy: "",
@@ -549,23 +715,20 @@ export default function App() {
   const addToCart = () => {
     if (!selectedBurger) return alert("Select a burger/item first.");
 
-    // Combine consumption map for this cart line from product + extras
     const uses = {};
     const prodUses = selectedBurger.uses || {};
     for (const k of Object.keys(prodUses)) uses[k] = (uses[k] || 0) + (prodUses[k] || 0);
-
     for (const ex of selectedExtras) {
       const exUses = ex.uses || {};
       for (const k of Object.keys(exUses)) uses[k] = (uses[k] || 0) + (exUses[k] || 0);
     }
 
     const line = {
-  ...selectedBurger,
-  extras: [...selectedExtras],
-  price: selectedBurger.price, // ✅ base only
-  uses,
-};
-
+      ...selectedBurger,
+      extras: [...selectedExtras],
+      price: selectedBurger.price,
+      uses,
+    };
 
     setCart((c) => [...c, line]);
     setSelectedBurger(null);
@@ -574,12 +737,10 @@ export default function App() {
 
   const removeFromCart = (i) => setCart((c) => c.filter((_, idx) => idx !== i));
 
-  const checkout = () => {
-    // cannot checkout unless a shift is actively started (and not ended)
+  const checkout = async () => {
     if (!dayMeta.startedAt || dayMeta.endedAt) {
       return alert("Start a shift first (Shift → Start Shift).");
     }
-
     if (cart.length === 0) return alert("Cart is empty.");
     if (!worker) return alert("Select worker.");
     if (!payment) return alert("Select payment.");
@@ -593,7 +754,6 @@ export default function App() {
         required[k] = (required[k] || 0) + (uses[k] || 0);
       }
     }
-
     // Check stock
     for (const k of Object.keys(required)) {
       const invItem = invById[k];
@@ -602,7 +762,6 @@ export default function App() {
         return alert(`Not enough ${invItem.name} in stock. Need ${required[k]} ${invItem.unit}, have ${invItem.qty} ${invItem.unit}.`);
       }
     }
-
     // Deduct inventory
     setInventory((inv) =>
       inv.map((it) => {
@@ -611,45 +770,50 @@ export default function App() {
       })
     );
 
-    // Base items subtotal (without extras)
-const baseSubtotal = cart.reduce((s, b) => s + Number(b.price || 0), 0);
-// Extras subtotal (sum of all extras on all lines)
-const extrasSubtotal = cart.reduce(
-  (s, b) => s + (b.extras || []).reduce((t, e) => t + Number(e.price || 0), 0),
-  0
-);
+    // Totals
+    const baseSubtotal = cart.reduce((s, b) => s + Number(b.price || 0), 0);
+    const extrasSubtotal = cart.reduce(
+      (s, b) => s + (b.extras || []).reduce((t, e) => t + Number(e.price || 0), 0),
+      0
+    );
+    const itemsTotal = baseSubtotal + extrasSubtotal;
+    const delFee = orderType === "Delivery" ? Math.max(0, Number(deliveryFee || 0)) : 0;
+    const total = itemsTotal + delFee;
 
-// itemsTotal should be base + extras (revenue)
-const itemsTotal = baseSubtotal + extrasSubtotal;
-
-const delFee = orderType === "Delivery" ? Math.max(0, Number(deliveryFee || 0)) : 0;
-const total = itemsTotal + delFee;
-
-const order = {
-  orderNo: nextOrderNo,
-  date: new Date(),
-  worker,
-  payment,
-  orderType,
-  deliveryFee: delFee,
-  total,
-  itemsTotal,     // ✅ still revenue (base + extras)
-  cart,
-  done: false,
-  voided: false,
-  restockedAt: undefined,
-  note: orderNote.trim(),
-};
+    const order = {
+      orderNo: nextOrderNo,
+      date: new Date(),
+      worker,
+      payment,
+      orderType,
+      deliveryFee: delFee,
+      total,
+      itemsTotal,
+      cart,
+      done: false,
+      voided: false,
+      restockedAt: undefined,
+      note: orderNote.trim(),
+    };
 
     setOrders((o) => [order, ...o]);
-setNextOrderNo((n) => n + 1);
+    setNextOrderNo((n) => n + 1);
 
-// Print customer receipt (58 mm) right after checkout
-printThermalTicket(order, 58, "Customer");
+    // Cloud write (orders collection)
+    if (cloudEnabled && ordersColRef && fbUser) {
+      try {
+        const ref = await addDoc(ordersColRef, normalizeOrderForCloud(order));
+        // attach cloudId to local order
+        setOrders((prev) =>
+          prev.map((oo) => (oo.orderNo === order.orderNo ? { ...oo, cloudId: ref.id } : oo))
+        );
+      } catch (e) {
+        console.warn("Cloud order write failed:", e);
+      }
+    }
 
-// reset builder
-setCart([]);
-
+    // Print customer receipt (58 mm)
+    printThermalTicket(order, 58, "Customer");
 
     // reset builder
     setCart([]);
@@ -661,7 +825,7 @@ setCart([]);
   };
 
   // --------- Order actions ----------
-  const markOrderDone = (orderNo) => {
+  const markOrderDone = async (orderNo) => {
     setOrders((o) =>
       o.map((ord) => {
         if (ord.orderNo !== orderNo) return ord;
@@ -669,9 +833,29 @@ setCart([]);
         return { ...ord, done: true };
       })
     );
+
+    // Cloud update
+    try {
+      if (!cloudEnabled || !ordersColRef || !fbUser) return;
+      let targetId = orders.find((o) => o.orderNo === orderNo)?.cloudId;
+      if (!targetId) {
+        // best-effort find by orderNo
+        const qy = query(ordersColRef, where("orderNo", "==", orderNo));
+        const ss = await getDocs(qy);
+        if (!ss.empty) targetId = ss.docs[0].id;
+      }
+      if (targetId) {
+        await updateDoc(fsDoc(db, "shops", SHOP_ID, "orders", targetId), {
+          done: true,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } catch (e) {
+      console.warn("Cloud update (done) failed:", e);
+    }
   };
 
-  const voidOrderAndRestock = (orderNo) => {
+  const voidOrderAndRestock = async (orderNo) => {
     const ord = orders.find((o) => o.orderNo === orderNo);
     if (!ord) return;
     if (ord.done) return alert("This order is DONE and cannot be voided.");
@@ -685,17 +869,35 @@ setCart([]);
         giveBack[k] = (giveBack[k] || 0) + (uses[k] || 0);
       }
     }
-
     setInventory((inv) =>
       inv.map((it) => {
         const back = giveBack[it.id] || 0;
         return back ? { ...it, qty: it.qty + back } : it;
       })
     );
-
     setOrders((o) =>
       o.map((x) => (x.orderNo === orderNo ? { ...x, voided: true, restockedAt: new Date() } : x))
     );
+
+    // Cloud update
+    try {
+      if (!cloudEnabled || !ordersColRef || !fbUser) return;
+      let targetId = ord.cloudId;
+      if (!targetId) {
+        const qy = query(ordersColRef, where("orderNo", "==", orderNo));
+        const ss = await getDocs(qy);
+        if (!ss.empty) targetId = ss.docs[0].id;
+      }
+      if (targetId) {
+        await updateDoc(fsDoc(db, "shops", SHOP_ID, "orders", targetId), {
+          voided: true,
+          restockedAt: new Date().toISOString(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } catch (e) {
+      console.warn("Cloud update (void) failed:", e);
+    }
   };
 
   // --------------------------- REPORT TOTALS ---------------------------
@@ -710,13 +912,10 @@ setCart([]);
 
   const totals = useMemo(() => {
     const validOrders = orders.filter((o) => !o.voided);
-
-    // REVENUE EXCLUDES DELIVERY FEES
     const revenueTotal = validOrders.reduce(
       (s, o) => s + Number(o.itemsTotal != null ? o.itemsTotal : (o.total - (o.deliveryFee || 0))),
       0
     );
-
     const byPay = {};
     for (const p of paymentMethods) byPay[p] = 0;
     for (const o of validOrders) {
@@ -724,7 +923,6 @@ setCart([]);
       if (byPay[o.payment] == null) byPay[o.payment] = 0;
       byPay[o.payment] += itemsOnly;
     }
-
     const byType = {};
     for (const t of orderTypes) byType[t] = 0;
     for (const o of validOrders) {
@@ -732,48 +930,36 @@ setCart([]);
       if (byType[o.orderType] == null) byType[o.orderType] = 0;
       byType[o.orderType] += itemsOnly;
     }
-
     const deliveryFeesTotal = validOrders.reduce((s, o) => s + (o.deliveryFee || 0), 0);
-
-    // Expenses total
     const expensesTotal = expenses.reduce((s, e) => s + Number((e.qty || 0) * (e.unitPrice || 0)), 0);
     const margin = revenueTotal - expensesTotal;
-
     return { revenueTotal, byPay, byType, deliveryFeesTotal, expensesTotal, margin };
   }, [orders, paymentMethods, orderTypes, expenses]);
 
-  // --- Product & extra frequency stats (exclude voided orders)
   const salesStats = useMemo(() => {
     const itemMap = new Map();
     const extraMap = new Map();
-
     const add = (map, id, name, count, revenue) => {
       const prev = map.get(id) || { id, name, count: 0, revenue: 0 };
       prev.count += count;
       prev.revenue += revenue;
       map.set(id, prev);
     };
-
     for (const o of orders) {
       if (o.voided) continue;
       for (const line of o.cart || []) {
-        const base = Number(line.price || 0); // ✅ base revenue = base price
-add(itemMap, line.id, line.name, 1, base);
-
-for (const ex of line.extras || []) {
-  add(extraMap, ex.id, ex.name, 1, Number(ex.price || 0)); // extras revenue stays the same
-}
-
+        const base = Number(line.price || 0);
+        add(itemMap, line.id, line.name, 1, base);
+        for (const ex of line.extras || []) {
+          add(extraMap, ex.id, ex.name, 1, Number(ex.price || 0));
+        }
       }
     }
-
     const items = Array.from(itemMap.values()).sort((a, b) => b.count - a.count || b.revenue - a.revenue);
     const extras = Array.from(extraMap.values()).sort((a, b) => b.count - a.count || b.revenue - a.revenue);
-
     return { items, extras };
   }, [orders]);
 
-  // Inventory deltas
   const inventoryReportRows = useMemo(() => {
     if (!inventorySnapshot || inventorySnapshot.length === 0) return [];
     const snapMap = {};
@@ -788,14 +974,12 @@ for (const ex of line.extras || []) {
   }, [inventory, inventorySnapshot]);
 
   // --------------------------- PDF: REPORT ---------------------------
-  // UPDATED: accepts optional meta override (to include end time in final PDF)
   const generatePDF = (silent = false, metaOverride = null) => {
     try {
       const m = metaOverride || dayMeta;
       const doc = new jsPDF();
       doc.text("TUX — Shift Report", 14, 12);
 
-      // Shift summary
       const startedStr = m.startedAt ? new Date(m.startedAt).toLocaleString() : "—";
       const endedStr = m.endedAt ? new Date(m.endedAt).toLocaleString() : "—";
 
@@ -806,7 +990,6 @@ for (const ex of line.extras || []) {
         theme: "grid",
       });
 
-      // Shift timeline (start, changes, end)
       let y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : 28;
       doc.text("Shift Timeline", 14, y);
       const timelineRows = [];
@@ -824,7 +1007,6 @@ for (const ex of line.extras || []) {
         styles: { fontSize: 10 },
       });
 
-      // Orders table
       y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : 28;
       doc.text("Orders", 14, y);
       autoTable(doc, {
@@ -844,7 +1026,6 @@ for (const ex of line.extras || []) {
         styles: { fontSize: 9 },
       });
 
-      // Totals
       y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : y + 40;
       doc.text("Totals (excluding voided)", 14, y);
 
@@ -869,7 +1050,6 @@ for (const ex of line.extras || []) {
         styles: { fontSize: 10 },
       });
 
-      // Product frequency tables in PDF
       y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : y + 40;
       doc.text("Items — Times Ordered", 14, y);
       autoTable(doc, {
@@ -888,7 +1068,6 @@ for (const ex of line.extras || []) {
         theme: "grid",
       });
 
-      // Inventory section
       y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : y + 40;
       doc.text("Inventory — Start vs Now", 14, y);
 
@@ -908,7 +1087,6 @@ for (const ex of line.extras || []) {
         });
       }
 
-      // Expenses section
       y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : y + 40;
       doc.text("Expenses (Shift)", 14, y);
       autoTable(doc, {
@@ -928,7 +1106,6 @@ for (const ex of line.extras || []) {
       });
 
       setDayMeta((d) => ({ ...d, lastReportAt: new Date() }));
-
       doc.save("tux_shift_report.pdf");
       if (!silent) alert("PDF downloaded.");
     } catch (err) {
@@ -938,126 +1115,105 @@ for (const ex of line.extras || []) {
   };
 
   // --------------------------- PDF: THERMAL TICKETS ---------------------------
-  // --------------------------- PDF: THERMAL TICKETS ---------------------------
-// If you use ESM + Vite, this import form is safer:
-// import { jsPDF } from "jspdf";
+  const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
+    try {
+      if (order.voided) return alert("This order is voided; no tickets can be printed.");
+      if (order.done && copy === "Kitchen") return alert("Order is done; kitchen ticket not available.");
 
-const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
-  try {
-    if (order.voided) return alert("This order is voided; no tickets can be printed.");
-    if (order.done && copy === "Kitchen") return alert("Order is done; kitchen ticket not available.");
+      const MAX_H = 1000;
+      const doc = new jsPDF({ unit: "mm", format: [widthMm, MAX_H], compress: true });
 
-    const MAX_H = 1000; // keep tall; do NOT shrink after drawing
-    const doc = new jsPDF({ unit: "mm", format: [widthMm, MAX_H], compress: true });
+      doc.setTextColor(0, 0, 0);
+      doc.setDrawColor(0, 0, 0);
 
-    // Safety: ensure black ink
-    doc.setTextColor(0, 0, 0);
-    doc.setDrawColor(0, 0, 0);
+      const margin = 4;
+      const colRight = widthMm - margin;
+      let y = margin;
 
-    const margin = 4;
-    const colRight = widthMm - margin;
-    let y = margin;
+      const safe = (s) => String(s ?? "").replace(/[\u2013\u2014]/g, "-");
 
-    // Replace unsupported dashes in core fonts
-    const safe = (s) => String(s ?? "").replace(/[\u2013\u2014]/g, "-");
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(12);
+      doc.text(safe("TUX - Burger Truck"), margin, y); y += 6;
 
-    // Header
-    doc.setFont("helvetica", "normal");
-    doc.setFontSize(12);
-    doc.text(safe("TUX - Burger Truck"), margin, y); y += 6;
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.text(`${safe(copy)} Copy`, margin, y); y += 5;
 
-    doc.setFont("helvetica", "normal");
-    doc.setFontSize(9);
-    doc.text(`${safe(copy)} Copy`, margin, y); y += 5;
+      doc.text(`Order #${order.orderNo}`, margin, y); y += 4;
+      doc.text(new Date(order.date).toLocaleString(), margin, y); y += 5;
 
-    doc.text(`Order #${order.orderNo}`, margin, y); y += 4;
-    doc.text(new Date(order.date).toLocaleString(), margin, y); y += 5;
+      doc.text(`Worker: ${safe(order.worker)}`, margin, y); y += 4;
+      doc.text(`Payment: ${safe(order.payment)} | Type: ${safe(order.orderType)}`, margin, y); y += 5;
 
-    doc.text(`Worker: ${safe(order.worker)}`, margin, y); y += 4;
-    doc.text(`Payment: ${safe(order.payment)} | Type: ${safe(order.orderType)}`, margin, y); y += 5;
+      if (order.orderType === "Delivery") {
+        doc.text(`Delivery Fee: E£${(order.deliveryFee || 0).toFixed(2)}`, margin, y);
+        y += 5;
+      }
 
-    if (order.orderType === "Delivery") {
-      doc.text(`Delivery Fee: E£${(order.deliveryFee || 0).toFixed(2)}`, margin, y);
-      y += 5;
-    }
+      if (order.note) {
+        doc.setFont("helvetica", "normal"); doc.text("NOTE:", margin, y);
+        doc.setFont("helvetica", "normal"); y += 5;
+        const wrapped = doc.splitTextToSize(safe(order.note), widthMm - margin * 2);
+        wrapped.forEach(line => { doc.text(line, margin, y); y += 4; });
+        y += 2;
+      }
 
-    if (order.note) {
-      doc.setFont("helvetica", "normal"); doc.text("NOTE:", margin, y);
-      doc.setFont("helvetica", "normal"); y += 5;
-      const wrapped = doc.splitTextToSize(safe(order.note), widthMm - margin * 2);
-      wrapped.forEach(line => { doc.text(line, margin, y); y += 4; });
-      y += 2;
-    }
+      doc.setFont("helvetica", "normal"); doc.text("Items", margin, y); y += 5;
+      doc.setFont("helvetica", "normal");
 
-    // Items
-    doc.setFont("helvetica", "normal"); doc.text("Items", margin, y); y += 5;
-    doc.setFont("helvetica", "normal");
-
-    order.cart.forEach((ci) => {
-      const nameWrapped = doc.splitTextToSize(safe(ci.name), widthMm - margin * 2);
-      nameWrapped.forEach((w, i) => {
-        doc.text(w, margin, y);
-        if (i === 0) doc.text(`E£${Number(ci.price || 0).toFixed(2)}`, colRight, y, { align: "right" });
-        y += 4;
-      });
-      (ci.extras || []).forEach((ex) => {
-        const exWrapped = doc.splitTextToSize(`+ ${safe(ex.name)}`, widthMm - margin * 2 - 2);
-        exWrapped.forEach((w, i) => {
-          doc.text(w, margin + 2, y);
-          if (i === 0) doc.text(`E£${Number(ex.price || 0).toFixed(2)}`, colRight, y, { align: "right" });
+      order.cart.forEach((ci) => {
+        const nameWrapped = doc.splitTextToSize(safe(ci.name), widthMm - margin * 2);
+        nameWrapped.forEach((w, i) => {
+          doc.text(w, margin, y);
+          if (i === 0) doc.text(`E£${Number(ci.price || 0).toFixed(2)}`, colRight, y, { align: "right" });
           y += 4;
         });
-      });
-      y += 1;
-    });
-
-    // Divider & totals
-    doc.line(margin, y, widthMm - margin, y); y += 3;
-    doc.setFont("helvetica", "normal");
-    doc.text("TOTAL", margin, y);
-    doc.text(`E£${Number(order.total || 0).toFixed(2)}`, widthMm - margin, y, { align: "right" });
-    y += 6;
-
-    doc.setFontSize(8);
-    if (order.voided) doc.text("VOIDED / RESTOCKED", margin, y);
-    else if (order.done) doc.text("DONE", margin, y);
-    else doc.text("Thank you! @TUX", margin, y);
-    y += 4;
-
-    // Optional logo — do not fail the ticket if it can't load
-    if (copy === "Customer") {
-      try {
-        const imgData = await loadAsDataURL("/tux-receipt.jpg"); // must be in /public
-        const im = await new Promise((resolve, reject) => {
-          const _im = new Image();
-          _im.onload = () => resolve(_im);
-          _im.onerror = reject;
-          _im.src = imgData;
+        (ci.extras || []).forEach((ex) => {
+          const exWrapped = doc.splitTextToSize(`+ ${safe(ex.name)}`, widthMm - margin * 2 - 2);
+          exWrapped.forEach((w, i) => {
+            doc.text(w, margin + 2, y);
+            if (i === 0) doc.text(`E£${Number(ex.price || 0).toFixed(2)}`, colRight, y, { align: "right" });
+            y += 4;
+          });
         });
-        const targetW = Math.min(38, widthMm - margin * 2);
-        const targetH = targetW * (im.height / im.width || 1);
-        doc.addImage(imgData, "JPEG", (widthMm - targetW) / 2, y, targetW, targetH);
-        y += targetH + 2;
+        y += 1;
+      });
 
-        
-      } catch {
-        // no-logo fallback, continue silently
+      doc.line(margin, y, widthMm - margin, y); y += 3;
+      doc.setFont("helvetica", "normal");
+      doc.text("TOTAL", margin, y);
+      doc.text(`E£${Number(order.total || 0).toFixed(2)}`, widthMm - margin, y, { align: "right" });
+      y += 6;
+
+      doc.setFontSize(8);
+      if (order.voided) doc.text("VOIDED / RESTOCKED", margin, y);
+      else if (order.done) doc.text("DONE", margin, y);
+      else doc.text("Thank you! @TUX", margin, y);
+      y += 4;
+
+      if (copy === "Customer") {
+        try {
+          const imgData = await loadAsDataURL("/tux-receipt.jpg");
+          const im = await new Promise((resolve, reject) => {
+            const _im = new Image();
+            _im.onload = () => resolve(_im);
+            _im.onerror = reject;
+            _im.src = imgData;
+          });
+          const targetW = Math.min(38, widthMm - margin * 2);
+          const targetH = targetW * (im.height / im.width || 1);
+          doc.addImage(imgData, "JPEG", (widthMm - targetW) / 2, y, targetW, targetH);
+          y += targetH + 2;
+        } catch {}
       }
+
+      doc.save(`tux_${copy.toLowerCase()}_${widthMm}mm_order_${order.orderNo}.pdf`);
+    } catch (err) {
+      console.error(err);
+      alert("Could not print ticket. Try again (ensure pop-ups/downloads are allowed).");
     }
-
-    // IMPORTANT: Do NOT resize page after drawing (this caused the white page)
-    // If you really want to trim, pre-measure y first and create the doc with that height from the start.
-
-    const label = copy.toLowerCase();
-    doc.save(`tux_${label}_${widthMm}mm_order_${order.orderNo}.pdf`);
-  } catch (err) {
-    console.error(err);
-    alert("Could not print ticket. Try again (ensure pop-ups/downloads are allowed).");
-  }
-};
-
-
-
+  };
 
   const cardBorder = dark ? "#555" : "#ddd";
   const softBg = dark ? "#1e1e1e" : "#f5f5f5";
@@ -1101,7 +1257,12 @@ const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
     }, 0);
   }, [bankTx]);
 
-  // --------------------------- UI ---------------------------
+  /* --------------------------- UI --------------------------- */
+  const firebaseConfigured =
+    FIREBASE_CONFIG &&
+    FIREBASE_CONFIG.apiKey &&
+    !FIREBASE_CONFIG.apiKey.includes("YOUR_");
+
   return (
     <div style={containerStyle}>
       {/* Header */}
@@ -1109,6 +1270,77 @@ const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
         <h1 style={{ margin: 0 }}>🍔 TUX — Burger Truck POS</h1>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <small>{nowStr}</small>
+
+          {/* Cloud controls */}
+          <div style={{ display: "flex", gap: 6, alignItems: "center", padding: "2px 6px", borderRadius: 6, border: `1px solid ${btnBorder}`, background: dark ? "#222" : "#f3f3f3" }}>
+            <span>☁</span>
+            {!firebaseConfigured && <small style={{ color: "#c62828" }}>Setup Firebase config</small>}
+            {firebaseConfigured && (
+              <>
+                <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                  <input
+                    type="checkbox"
+                    checked={cloudEnabled}
+                    onChange={(e) => setCloudEnabled(e.target.checked)}
+                  />
+                  <small>Autosync</small>
+                </label>
+                <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                  <input
+                    type="checkbox"
+                    checked={realtimeOrders}
+                    onChange={(e) => setRealtimeOrders(e.target.checked)}
+                  />
+                  <small>Realtime Orders</small>
+                </label>
+                <button
+                  onClick={async () => {
+                    try {
+                      if (!stateDocRef || !fbUser) return;
+                      const body = packStateForCloud({
+                        menu,
+                        extraList,
+                        orders,
+                        inventory,
+                        nextOrderNo,
+                        dark,
+                        workers,
+                        paymentMethods,
+                        inventoryLocked,
+                        inventorySnapshot,
+                        inventoryLockedAt,
+                        adminPins,
+                        orderTypes,
+                        defaultDeliveryFee,
+                        expenses,
+                        dayMeta,
+                        bankTx,
+                      });
+                      await setDoc(stateDocRef, body, { merge: true });
+                      setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(), error: null }));
+                      alert("Synced to cloud ✔");
+                    } catch (e) {
+                      setCloudStatus((s) => ({ ...s, error: String(e) }));
+                      alert("Cloud sync failed: " + e);
+                    }
+                  }}
+                  style={{ padding: "4px 8px", borderRadius: 6, border: `1px solid ${btnBorder}`, background: "#e0f2f1", cursor: "pointer" }}
+                >
+                  Sync now
+                </button>
+                <button
+                  onClick={loadFromCloud}
+                  style={{ padding: "4px 8px", borderRadius: 6, border: `1px solid ${btnBorder}`, background: "#e3f2fd", cursor: "pointer" }}
+                >
+                  Load from cloud
+                </button>
+                <small style={{ opacity: 0.7 }}>
+                  {cloudStatus.lastSaveAt ? `Saved: ${cloudStatus.lastSaveAt.toLocaleTimeString()}` : ""}
+                </small>
+              </>
+            )}
+          </div>
+
           <button
             onClick={() => setDark((d) => !d)}
             style={{
@@ -1313,12 +1545,12 @@ const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
           </ul>
 
           <p>
-<strong>Items Total:</strong> E£{
-  cart.reduce(
-    (s, b) => s + Number(b.price || 0) + (b.extras || []).reduce((t, e) => t + Number(e.price || 0), 0),
-    0
-  ).toFixed(2)
-}
+            <strong>Items Total:</strong> E£{
+              cart.reduce(
+                (s, b) => s + Number(b.price || 0) + (b.extras || []).reduce((t, e) => t + Number(e.price || 0), 0),
+                0
+              ).toFixed(2)
+            }
           </p>
 
           {/* Order notes */}
@@ -1362,11 +1594,14 @@ const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
               ))}
             </select>
 
-            <select value={orderType} onChange={(e) => {
-              const v = e.target.value;
-              setOrderType(v);
-              setDeliveryFee(v === "Delivery" ? (deliveryFee || defaultDeliveryFee) : 0);
-            }}>
+            <select
+              value={orderType}
+              onChange={(e) => {
+                const v = e.target.value;
+                setOrderType(v);
+                setDeliveryFee(v === "Delivery" ? (deliveryFee || defaultDeliveryFee) : 0);
+              }}
+            >
               {orderTypes.map((t) => (
                 <option key={t} value={t}>{t}</option>
               ))}
@@ -1407,14 +1642,13 @@ const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
           <p style={{ marginTop: 8 }}>
             <strong>Order Total (incl. delivery if any):</strong>{" "}
             E£{
-  (
-    cart.reduce(
-      (s, b) => s + Number(b.price || 0) + (b.extras || []).reduce((t, e) => t + Number(e.price || 0), 0),
-      0
-    ) + (orderType === "Delivery" ? Number(deliveryFee || 0) : 0)
-  ).toFixed(2)
-}
-
+              (
+                cart.reduce(
+                  (s, b) => s + Number(b.price || 0) + (b.extras || []).reduce((t, e) => t + Number(e.price || 0), 0),
+                  0
+                ) + (orderType === "Delivery" ? Number(deliveryFee || 0) : 0)
+              ).toFixed(2)
+            }
           </p>
         </div>
       )}
@@ -1422,12 +1656,12 @@ const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
       {/* ORDERS BOARD */}
       {activeTab === "board" && (
         <div>
-          <h2>Orders Board</h2>
+          <h2>Orders Board {realtimeOrders ? "(Live)" : ""}</h2>
           {orders.length === 0 && <p>No orders yet.</p>}
           <ul style={{ listStyle: "none", padding: 0 }}>
             {orders.map((o) => (
               <li
-                key={o.orderNo}
+                key={`${o.cloudId || "local"}_${o.orderNo}`}
                 style={{
                   border: `1px solid ${cardBorder}`,
                   borderRadius: 6,
@@ -1440,7 +1674,7 @@ const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
               >
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
                   <strong>
-                    Order #{o.orderNo} — E£{o.total.toFixed(2)}
+                    Order #{o.orderNo} — E£{o.total.toFixed(2)} {o.cloudId ? "☁" : ""}
                   </strong>
                   <span>{o.date.toLocaleString()}</span>
                 </div>
@@ -1972,7 +2206,7 @@ const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
                     {salesStats.items.length === 0 && (
                       <tr>
                         <td colSpan={3} style={{ padding: 6, color: dark ? "#bbb" : "#666" }}>
-                          No sales yet.
+                          No item sales yet.
                         </td>
                       </tr>
                     )}
@@ -2001,7 +2235,7 @@ const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
                     {salesStats.extras.length === 0 && (
                       <tr>
                         <td colSpan={3} style={{ padding: 6, color: dark ? "#bbb" : "#666" }}>
-                          No extras sold yet.
+                          No extra sales yet.
                         </td>
                       </tr>
                     )}
@@ -2010,596 +2244,442 @@ const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
               </div>
             </div>
           </div>
+        </div>
+      )}
 
-          {/* Orders table (sorted) */}
-          <div style={{ marginTop: 12 }}>
-            <h3>Orders (excluding voided)</h3>
+      {/* PRICES (PIN gated by Editor PIN) */}
+      {activeTab === "prices" && (
+        <div>
+          <h2>Prices & Settings</h2>
+
+          {/* Menu editor */}
+          <div style={{ marginBottom: 16, padding: 10, background: softBg, borderRadius: 6 }}>
+            <h3 style={{ marginTop: 0 }}>Menu Items</h3>
             <table style={{ width: "100%", borderCollapse: "collapse" }}>
               <thead>
                 <tr>
-                  <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>#</th>
-                  <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Date</th>
-                  <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Worker</th>
-                  <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Payment</th>
-                  <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Type</th>
-                  <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Delivery (E£)</th>
-                  <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Total (E£)</th>
-                  <th style={{ textAlign: "center", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Done</th>
-                  <th style={{ textAlign: "center", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Voided</th>
+                  <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Name</th>
+                  <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Price (E£)</th>
+                  <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Uses</th>
+                  <th style={{ borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {getSortedOrders().map((o) => (
-                  <tr key={o.orderNo}>
-                    <td style={{ padding: 6 }}>{o.orderNo}</td>
-                    <td style={{ padding: 6 }}>{o.date.toLocaleString()}</td>
-                    <td style={{ padding: 6 }}>{o.worker}</td>
-                    <td style={{ padding: 6 }}>{o.payment}</td>
-                    <td style={{ padding: 6 }}>{o.orderType || "-"}</td>
-                    <td style={{ padding: 6, textAlign: "right" }}>{(o.deliveryFee || 0).toFixed(2)}</td>
-                    <td style={{ padding: 6, textAlign: "right" }}>{o.total.toFixed(2)}</td>
-                    <td style={{ padding: 6, textAlign: "center" }}>{o.done ? "Yes" : "No"}</td>
-                    <td style={{ padding: 6, textAlign: "center" }}>{o.voided ? "Yes" : "No"}</td>
+                {menu.map((m) => (
+                  <tr key={m.id}>
+                    <td style={{ padding: 6 }}>
+                      <input
+                        value={m.name}
+                        onChange={(e) =>
+                          setMenu((arr) =>
+                            arr.map((x) => (x.id === m.id ? { ...x, name: e.target.value } : x))
+                          )
+                        }
+                        style={{ width: "100%" }}
+                      />
+                    </td>
+                    <td style={{ padding: 6, textAlign: "right" }}>
+                      <input
+                        type="number"
+                        value={m.price}
+                        onChange={(e) =>
+                          setMenu((arr) =>
+                            arr.map((x) => (x.id === m.id ? { ...x, price: Number(e.target.value || 0) } : x))
+                          )
+                        }
+                        style={{ width: 120, textAlign: "right" }}
+                      />
+                    </td>
+                    <td style={{ padding: 6 }}>
+                      <button
+                        onClick={() =>
+                          setUsesEditOpenMenu((s) => ({ ...s, [m.id]: !s[m.id] }))
+                        }
+                        style={{ background: "#1976d2", color: "white", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer" }}
+                      >
+                        {usesEditOpenMenu[m.id] ? "Hide Uses" : "Edit Uses"}
+                      </button>
+                      {usesEditOpenMenu[m.id] && (
+                        <div style={{ marginTop: 8, display: "grid", gap: 6, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))" }}>
+                          {inventory.map((inv) => {
+                            const v = (m.uses && m.uses[inv.id]) || 0;
+                            return (
+                              <label key={inv.id} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                <span style={{ minWidth: 90 }}>{inv.name} ({inv.unit}):</span>
+                                <input
+                                  type="number"
+                                  value={v}
+                                  onChange={(e) => {
+                                    const num = Math.max(0, Number(e.target.value || 0));
+                                    setMenu((arr) =>
+                                      arr.map((x) =>
+                                        x.id === m.id ? { ...x, uses: { ...(x.uses || {}), [inv.id]: num } } : x
+                                      )
+                                    );
+                                  }}
+                                  style={{ width: 100 }}
+                                />
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </td>
+                    <td style={{ padding: 6 }}>
+                      <button
+                        onClick={() => setMenu((arr) => arr.filter((x) => x.id !== m.id))}
+                        style={{ background: "#ef5350", color: "white", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer" }}
+                      >
+                        Delete
+                      </button>
+                    </td>
                   </tr>
                 ))}
-                {orders.length === 0 && (
+                {menu.length === 0 && (
                   <tr>
-                    <td colSpan={9} style={{ padding: 6, color: dark ? "#bbb" : "#666" }}>
-                      No orders yet.
+                    <td colSpan={4} style={{ padding: 6, color: dark ? "#bbb" : "#666" }}>
+                      No menu items yet.
                     </td>
                   </tr>
                 )}
               </tbody>
             </table>
-          </div>
 
-          {/* Inventory delta */}
-          <div style={{ marginTop: 12 }}>
-            <h3>Inventory — Start vs Now</h3>
-            {inventoryReportRows.length === 0 ? (
-              <div style={{ padding: 10, background: softBg, borderRadius: 6 }}>
-                Lock inventory at the start of the day to track usage.
-              </div>
-            ) : (
-              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead>
-                  <tr>
-                    <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Item</th>
-                    <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Unit</th>
-                    <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Start</th>
-                    <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Now</th>
-                    <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Used</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {inventoryReportRows.map((r, i) => (
-                    <tr key={`${r.name}_${i}`}>
-                      <td style={{ padding: 6 }}>{r.name}</td>
-                      <td style={{ padding: 6 }}>{r.unit}</td>
-                      <td style={{ padding: 6, textAlign: "right" }}>                      {r.start}</td>
-                      <td style={{ padding: 6, textAlign: "right" }}>{r.now}</td>
-                      <td style={{ padding: 6, textAlign: "right" }}>{r.used}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* PRICES (PIN protected) */}
-      {activeTab === "prices" && (
-        <div>
-          <h2>Prices & Setup</h2>
-          {!pricesUnlocked ? (
-            <div style={{ padding: 10, background: softBg, borderRadius: 6 }}>
-              <p>This tab is protected by the Editor PIN.</p>
+            <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <input
+                placeholder="New item name"
+                value={newMenuName}
+                onChange={(e) => setNewMenuName(e.target.value)}
+                style={{ minWidth: 220 }}
+              />
+              <input
+                type="number"
+                placeholder="Price (E£)"
+                value={newMenuPrice}
+                onChange={(e) => setNewMenuPrice(Number(e.target.value || 0))}
+                style={{ width: 140 }}
+              />
+              <button
+                onClick={() => {
+                  const nm = newMenuName.trim();
+                  if (!nm) return alert("Enter item name");
+                  const nextId = Math.max(0, ...menu.map((x) => Number(x.id) || 0), ...extraList.map((x) => Number(x.id) || 0)) + 1;
+                  setMenu((arr) => [...arr, { id: nextId, name: nm, price: Math.max(0, newMenuPrice), uses: {} }]);
+                  setNewMenuName("");
+                  setNewMenuPrice(0);
+                }}
+                style={{ background: "#1976d2", color: "white", border: "none", borderRadius: 6, padding: "6px 10px", cursor: "pointer" }}
+              >
+                Add Menu Item
+              </button>
             </div>
-          ) : (
-            <>
-              {/* MENU EDITOR */}
-              <div style={{ marginBottom: 16, padding: 10, background: softBg, borderRadius: 6 }}>
-                <h3 style={{ marginTop: 0 }}>Menu Items</h3>
-                <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                  <thead>
-                    <tr>
-                      <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Name</th>
-                      <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Price (E£)</th>
-                      <th style={{ borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Uses</th>
-                      <th style={{ borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {menu.map((it) => (
-                      <React.Fragment key={it.id}>
-                        <tr>
-                          <td style={{ padding: 6 }}>
-                            <input
-                              value={it.name}
-                              onChange={(e) =>
-                                setMenu((arr) =>
-                                  arr.map((x) => (x.id === it.id ? { ...x, name: e.target.value } : x))
-                                )
-                              }
-                              style={{ width: "100%" }}
-                            />
-                          </td>
-                          <td style={{ padding: 6, textAlign: "right" }}>
-                            <input
-                              type="number"
-                              value={it.price}
-                              onChange={(e) =>
-                                setMenu((arr) =>
-                                  arr.map((x) =>
-                                    x.id === it.id ? { ...x, price: Math.max(0, Number(e.target.value || 0)) } : x
-                                  )
-                                )
-                              }
-                              style={{ width: 120, textAlign: "right" }}
-                            />
-                          </td>
-                          <td style={{ padding: 6, textAlign: "center" }}>
-                            <button
-                              onClick={() =>
-                                setUsesEditOpenMenu((m) => ({ ...m, [it.id]: !m[it.id] }))
-                              }
-                              style={{
-                                background: usesEditOpenMenu[it.id] ? "#1976d2" : "#9e9e9e",
-                                color: "white",
-                                border: "none",
-                                borderRadius: 6,
-                                padding: "4px 8px",
-                                cursor: "pointer",
-                              }}
-                            >
-                              {usesEditOpenMenu[it.id] ? "Hide Uses" : "Edit Uses"}
-                            </button>
-                          </td>
-                          <td style={{ padding: 6 }}>
-                            <button
-                              onClick={() => setMenu((arr) => arr.filter((x) => x.id !== it.id))}
-                              style={{
-                                background: "#ef5350",
-                                color: "white",
-                                border: "none",
-                                borderRadius: 6,
-                                padding: "4px 8px",
-                                cursor: "pointer",
-                              }}
-                            >
-                              Delete
-                            </button>
-                          </td>
-                        </tr>
-                        {usesEditOpenMenu[it.id] && (
-                          <tr>
-                            <td colSpan={4} style={{ padding: 6, background: dark ? "#1e1e1e" : "#fafafa" }}>
-                              <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-                                {inventory.length === 0 && (
-                                  <em style={{ color: dark ? "#bbb" : "#666" }}>
-                                    No inventory items yet. Add some in Inventory tab to define consumption.
-                                  </em>
-                                )}
-                                {inventory.map((invItem) => (
-                                  <label key={invItem.id} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                                    <span style={{ minWidth: 120 }}>{invItem.name} ({invItem.unit}):</span>
-                                    <input
-                                      type="number"
-                                      value={Number((it.uses || {})[invItem.id] || 0)}
-                                      onChange={(e) => {
-                                        const val = Math.max(0, Number(e.target.value || 0));
-                                        setMenu((arr) =>
-                                          arr.map((x) => {
-                                            if (x.id !== it.id) return x;
-                                            const nu = { ...(x.uses || {}) };
-                                            if (val === 0) {
-                                              delete nu[invItem.id];
-                                            } else {
-                                              nu[invItem.id] = val;
-                                            }
-                                            return { ...x, uses: nu };
-                                          })
-                                        );
-                                      }}
-                                      style={{ width: 100 }}
-                                    />
-                                  </label>
-                                ))}
-                              </div>
-                            </td>
-                          </tr>
-                        )}
-                      </React.Fragment>
-                    ))}
-                    {menu.length === 0 && (
-                      <tr>
-                        <td colSpan={4} style={{ padding: 6, color: dark ? "#bbb" : "#666" }}>
-                          No items yet.
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
+          </div>
 
-                <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                  <input
-                    placeholder="New item name"
-                    value={newMenuName}
-                    onChange={(e) => setNewMenuName(e.target.value)}
-                    style={{ minWidth: 220 }}
-                  />
-                  <input
-                    type="number"
-                    placeholder="Price (E£)"
-                    value={newMenuPrice}
-                    onChange={(e) => setNewMenuPrice(Number(e.target.value || 0))}
-                    style={{ width: 140 }}
-                  />
-                  <button
-                    onClick={() => {
-                      const nm = newMenuName.trim();
-                      if (!nm) return alert("Enter item name");
-                      const id = `m_${Date.now()}`;
-                      setMenu((arr) => [...arr, { id, name: nm, price: Math.max(0, Number(newMenuPrice || 0)), uses: {} }]);
-                      setNewMenuName("");
-                      setNewMenuPrice(0);
-                    }}
-                    style={{ background: "#1976d2", color: "white", border: "none", borderRadius: 6, padding: "6px 10px", cursor: "pointer" }}
-                  >
-                    Add Item
-                  </button>
-                </div>
-              </div>
-
-              {/* EXTRAS EDITOR */}
-              <div style={{ marginBottom: 16, padding: 10, background: softBg, borderRadius: 6 }}>
-                <h3 style={{ marginTop: 0 }}>Extras</h3>
-                <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                  <thead>
-                    <tr>
-                      <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Name</th>
-                      <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Price (E£)</th>
-                      <th style={{ borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Uses</th>
-                      <th style={{ borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {extraList.map((ex) => (
-                      <React.Fragment key={ex.id}>
-                        <tr>
-                          <td style={{ padding: 6 }}>
-                            <input
-                              value={ex.name}
-                              onChange={(e) =>
-                                setExtraList((arr) =>
-                                  arr.map((x) => (x.id === ex.id ? { ...x, name: e.target.value } : x))
-                                )
-                              }
-                              style={{ width: "100%" }}
-                            />
-                          </td>
-                          <td style={{ padding: 6, textAlign: "right" }}>
-                            <input
-                              type="number"
-                              value={ex.price}
-                              onChange={(e) =>
-                                setExtraList((arr) =>
-                                  arr.map((x) =>
-                                    x.id === ex.id ? { ...x, price: Math.max(0, Number(e.target.value || 0)) } : x
-                                  )
-                                )
-                              }
-                              style={{ width: 120, textAlign: "right" }}
-                            />
-                          </td>
-                          <td style={{ padding: 6, textAlign: "center" }}>
-                            <button
-                              onClick={() =>
-                                setUsesEditOpenExtra((m) => ({ ...m, [ex.id]: !m[ex.id] }))
-                              }
-                              style={{
-                                background: usesEditOpenExtra[ex.id] ? "#1976d2" : "#9e9e9e",
-                                color: "white",
-                                border: "none",
-                                borderRadius: 6,
-                                padding: "4px 8px",
-                                cursor: "pointer",
-                              }}
-                            >
-                              {usesEditOpenExtra[ex.id] ? "Hide Uses" : "Edit Uses"}
-                            </button>
-                          </td>
-                          <td style={{ padding: 6 }}>
-                            <button
-                              onClick={() => setExtraList((arr) => arr.filter((x) => x.id !== ex.id))}
-                              style={{
-                                background: "#ef5350",
-                                color: "white",
-                                border: "none",
-                                borderRadius: 6,
-                                padding: "4px 8px",
-                                cursor: "pointer",
-                              }}
-                            >
-                              Delete
-                            </button>
-                          </td>
-                        </tr>
-                        {usesEditOpenExtra[ex.id] && (
-                          <tr>
-                            <td colSpan={4} style={{ padding: 6, background: dark ? "#1e1e1e" : "#fafafa" }}>
-                              <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-                                {inventory.length === 0 && (
-                                  <em style={{ color: dark ? "#bbb" : "#666" }}>
-                                    No inventory items yet. Add some in Inventory tab to define consumption.
-                                  </em>
-                                )}
-                                {inventory.map((invItem) => (
-                                  <label key={invItem.id} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                                    <span style={{ minWidth: 120 }}>{invItem.name} ({invItem.unit}):</span>
-                                    <input
-                                      type="number"
-                                      value={Number((ex.uses || {})[invItem.id] || 0)}
-                                      onChange={(e) => {
-                                        const val = Math.max(0, Number(e.target.value || 0));
-                                        setExtraList((arr) =>
-                                          arr.map((x) => {
-                                            if (x.id !== ex.id) return x;
-                                            const nu = { ...(x.uses || {}) };
-                                            if (val === 0) {
-                                              delete nu[invItem.id];
-                                            } else {
-                                              nu[invItem.id] = val;
-                                            }
-                                            return { ...x, uses: nu };
-                                          })
-                                        );
-                                      }}
-                                      style={{ width: 100 }}
-                                    />
-                                  </label>
-                                ))}
-                              </div>
-                            </td>
-                          </tr>
-                        )}
-                      </React.Fragment>
-                    ))}
-                    {extraList.length === 0 && (
-                      <tr>
-                        <td colSpan={4} style={{ padding: 6, color: dark ? "#bbb" : "#666" }}>
-                          No extras yet.
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-
-                <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                  <input
-                    placeholder="New extra name"
-                    value={newExtraName}
-                    onChange={(e) => setNewExtraName(e.target.value)}
-                    style={{ minWidth: 220 }}
-                  />
-                  <input
-                    type="number"
-                    placeholder="Price (E£)"
-                    value={newExtraPrice}
-                    onChange={(e) => setNewExtraPrice(Number(e.target.value || 0))}
-                    style={{ width: 140 }}
-                  />
-                  <button
-                    onClick={() => {
-                      const nm = newExtraName.trim();
-                      if (!nm) return alert("Enter extra name");
-                      const id = `x_${Date.now()}`;
-                      setExtraList((arr) => [...arr, { id, name: nm, price: Math.max(0, Number(newExtraPrice || 0)), uses: {} }]);
-                      setNewExtraName("");
-                      setNewExtraPrice(0);
-                    }}
-                    style={{ background: "#1976d2", color: "white", border: "none", borderRadius: 6, padding: "6px 10px", cursor: "pointer" }}
-                  >
-                    Add Extra
-                  </button>
-                </div>
-              </div>
-
-              {/* ORDER TYPES & DEFAULT DELIVERY FEE */}
-              <div style={{ marginBottom: 16, padding: 10, background: softBg, borderRadius: 6 }}>
-                <h3 style={{ marginTop: 0 }}>Order Types & Delivery Fee</h3>
-                <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
-                  <label>
-                    Default Delivery Fee:&nbsp;
-                    <input
-                      type="number"
-                      value={defaultDeliveryFee}
-                      onChange={(e) => setDefaultDeliveryFee(Math.max(0, Number(e.target.value || 0)))}
-                      style={{ width: 140 }}
-                    />
-                  </label>
-                </div>
-                <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-                  {orderTypes.map((t) => (
-                    <span key={t} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 8px", border: `1px solid ${btnBorder}`, borderRadius: 6 }}>
-                      {t}
+          {/* Extras editor */}
+          <div style={{ marginBottom: 16, padding: 10, background: softBg, borderRadius: 6 }}>
+            <h3 style={{ marginTop: 0 }}>Extras</h3>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Name</th>
+                  <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Price (E£)</th>
+                  <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Uses</th>
+                  <th style={{ borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {extraList.map((ex) => (
+                  <tr key={ex.id}>
+                    <td style={{ padding: 6 }}>
+                      <input
+                        value={ex.name}
+                        onChange={(e) =>
+                          setExtraList((arr) =>
+                            arr.map((x) => (x.id === ex.id ? { ...x, name: e.target.value } : x))
+                          )
+                        }
+                        style={{ width: "100%" }}
+                      />
+                    </td>
+                    <td style={{ padding: 6, textAlign: "right" }}>
+                      <input
+                        type="number"
+                        value={ex.price}
+                        onChange={(e) =>
+                          setExtraList((arr) =>
+                            arr.map((x) => (x.id === ex.id ? { ...x, price: Number(e.target.value || 0) } : x))
+                          )
+                        }
+                        style={{ width: 120, textAlign: "right" }}
+                      />
+                    </td>
+                    <td style={{ padding: 6 }}>
                       <button
-                        onClick={() => setOrderTypes((arr) => arr.filter((x) => x !== t))}
-                        style={{ background: "#ef5350", color: "white", border: "none", borderRadius: 4, padding: "2px 6px", cursor: "pointer" }}
+                        onClick={() =>
+                          setUsesEditOpenExtra((s) => ({ ...s, [ex.id]: !s[ex.id] }))
+                        }
+                        style={{ background: "#1976d2", color: "white", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer" }}
                       >
-                        ×
+                        {usesEditOpenExtra[ex.id] ? "Hide Uses" : "Edit Uses"}
                       </button>
-                    </span>
-                  ))}
-                </div>
-                <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                  <input
-                    placeholder="Add order type (e.g., Take-Away)"
-                    value={newPayment}
-                    onChange={(e) => setNewPayment(e.target.value)}
-                    style={{ minWidth: 220 }}
-                  />
+                      {usesEditOpenExtra[ex.id] && (
+                        <div style={{ marginTop: 8, display: "grid", gap: 6, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))" }}>
+                          {inventory.map((inv) => {
+                            const v = (ex.uses && ex.uses[inv.id]) || 0;
+                            return (
+                              <label key={inv.id} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                <span style={{ minWidth: 90 }}>{inv.name} ({inv.unit}):</span>
+                                <input
+                                  type="number"
+                                  value={v}
+                                  onChange={(e) => {
+                                    const num = Math.max(0, Number(e.target.value || 0));
+                                    setExtraList((arr) =>
+                                      arr.map((x) =>
+                                        x.id === ex.id ? { ...x, uses: { ...(x.uses || {}), [inv.id]: num } } : x
+                                      )
+                                    );
+                                  }}
+                                  style={{ width: 100 }}
+                                />
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </td>
+                    <td style={{ padding: 6 }}>
+                      <button
+                        onClick={() => setExtraList((arr) => arr.filter((x) => x.id !== ex.id))}
+                        style={{ background: "#ef5350", color: "white", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer" }}
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {extraList.length === 0 && (
+                  <tr>
+                    <td colSpan={4} style={{ padding: 6, color: dark ? "#bbb" : "#666" }}>
+                      No extras yet.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+
+            <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <input
+                placeholder="New extra name"
+                value={newExtraName}
+                onChange={(e) => setNewExtraName(e.target.value)}
+                style={{ minWidth: 220 }}
+              />
+              <input
+                type="number"
+                placeholder="Price (E£)"
+                value={newExtraPrice}
+                onChange={(e) => setNewExtraPrice(Number(e.target.value || 0))}
+                style={{ width: 140 }}
+              />
+              <button
+                onClick={() => {
+                  const nm = newExtraName.trim();
+                  if (!nm) return alert("Enter extra name");
+                  const nextId = Math.max(0, ...menu.map((x) => Number(x.id) || 0), ...extraList.map((x) => Number(x.id) || 0)) + 1;
+                  setExtraList((arr) => [...arr, { id: nextId, name: nm, price: Math.max(0, newExtraPrice), uses: {} }]);
+                  setNewExtraName("");
+                  setNewExtraPrice(0);
+                }}
+                style={{ background: "#1976d2", color: "white", border: "none", borderRadius: 6, padding: "6px 10px", cursor: "pointer" }}
+              >
+                Add Extra
+              </button>
+            </div>
+          </div>
+
+          {/* Order types & delivery fee */}
+          <div style={{ marginBottom: 16, padding: 10, background: softBg, borderRadius: 6 }}>
+            <h3 style={{ marginTop: 0 }}>Order Options</h3>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
+              {orderTypes.map((t) => (
+                <span key={t} style={{ display: "inline-flex", alignItems: "center", gap: 6, border: `1px solid ${btnBorder}`, borderRadius: 6, padding: "4px 8px" }}>
+                  {t}
                   <button
-                    onClick={() => {
-                      const v = newPayment.trim();
-                      if (!v) return;
-                      if (orderTypes.includes(v)) return alert("Already exists.");
-                      setOrderTypes((arr) => [...arr, v]);
-                      setNewPayment("");
-                    }}
-                    style={{ background: "#1976d2", color: "white", border: "none", borderRadius: 6, padding: "6px 10px", cursor: "pointer" }}
+                    onClick={() => setOrderTypes((arr) => arr.filter((x) => x !== t))}
+                    style={{ background: "#ef5350", color: "white", border: "none", borderRadius: 4, padding: "2px 6px", cursor: "pointer" }}
                   >
-                    Add Type
+                    ×
                   </button>
-                </div>
-              </div>
+                </span>
+              ))}
+              <input
+                placeholder="Add order type"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    const v = String(e.currentTarget.value || "").trim();
+                    if (!v) return;
+                    if (orderTypes.includes(v)) return alert("Type already exists.");
+                    setOrderTypes((arr) => [...arr, v]);
+                    e.currentTarget.value = "";
+                  }
+                }}
+                style={{ minWidth: 180 }}
+              />
+            </div>
+            <div>
+              <label>
+                Default Delivery Fee (E£):&nbsp;
+                <input
+                  type="number"
+                  value={defaultDeliveryFee}
+                  onChange={(e) => setDefaultDeliveryFee(Number(e.target.value || 0))}
+                  style={{ width: 140 }}
+                />
+              </label>
+            </div>
+          </div>
 
-              {/* WORKERS & PAYMENTS */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-                <div style={{ padding: 10, background: softBg, borderRadius: 6 }}>
-                  <h3 style={{ marginTop: 0 }}>Workers</h3>
-                  <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-                    <input
-                      placeholder="Add worker"
-                      value={newWorker}
-                      onChange={(e) => setNewWorker(e.target.value)}
-                      style={{ minWidth: 220 }}
-                    />
+          {/* Workers & payments */}
+          <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))" }}>
+            <div style={{ padding: 10, background: softBg, borderRadius: 6 }}>
+              <h3 style={{ marginTop: 0 }}>Workers</h3>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+                {workers.map((w) => (
+                  <span key={w} style={{ display: "inline-flex", alignItems: "center", gap: 6, border: `1px solid ${btnBorder}`, borderRadius: 6, padding: "4px 8px" }}>
+                    {w}
                     <button
-                      onClick={() => {
-                        const v = newWorker.trim();
-                        if (!v) return;
-                        if (workers.includes(v)) return alert("Already exists.");
-                        setWorkers((arr) => [...arr, v]);
-                        setNewWorker("");
-                      }}
-                      style={{ background: "#1976d2", color: "white", border: "none", borderRadius: 6, padding: "6px 10px", cursor: "pointer" }}
+                      onClick={() => setWorkers((arr) => arr.filter((x) => x !== w))}
+                      style={{ background: "#ef5350", color: "white", border: "none", borderRadius: 4, padding: "2px 6px", cursor: "pointer" }}
                     >
-                      Add
+                      ×
                     </button>
-                  </div>
-                  <ul>
-                    {workers.map((w) => (
-                      <li key={w} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-                        <span>{w}</span>
-                        <button
-                          onClick={() => setWorkers((arr) => arr.filter((x) => x !== w))}
-                          style={{ background: "#ef5350", color: "white", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer" }}
-                        >
-                          Delete
-                        </button>
-                      </li>
-                    ))}
-                    {workers.length === 0 && <li style={{ color: dark ? "#bbb" : "#666" }}>No workers yet.</li>}
-                  </ul>
-                </div>
+                  </span>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  placeholder="Add worker"
+                  value={newWorker}
+                  onChange={(e) => setNewWorker(e.target.value)}
+                  style={{ flex: 1 }}
+                />
+                <button
+                  onClick={() => {
+                    const v = newWorker.trim();
+                    if (!v) return;
+                    if (workers.includes(v)) return alert("Worker already exists.");
+                    setWorkers((arr) => [...arr, v]);
+                    setNewWorker("");
+                  }}
+                  style={{ background: "#1976d2", color: "white", border: "none", borderRadius: 6, padding: "6px 10px", cursor: "pointer" }}
+                >
+                  Add
+                </button>
+              </div>
+            </div>
 
-                <div style={{ padding: 10, background: softBg, borderRadius: 6 }}>
-                  <h3 style={{ marginTop: 0 }}>Payment Methods</h3>
-                  <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-                    <input
-                      placeholder="Add payment method"
-                      value={newPayment}
-                      onChange={(e) => setNewPayment(e.target.value)}
-                      style={{ minWidth: 220 }}
-                    />
+            <div style={{ padding: 10, background: softBg, borderRadius: 6 }}>
+              <h3 style={{ marginTop: 0 }}>Payment Methods</h3>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+                {paymentMethods.map((p) => (
+                  <span key={p} style={{ display: "inline-flex", alignItems: "center", gap: 6, border: `1px solid ${btnBorder}`, borderRadius: 6, padding: "4px 8px" }}>
+                    {p}
                     <button
-                      onClick={() => {
-                        const v = newPayment.trim();
-                        if (!v) return;
-                        if (paymentMethods.includes(v)) return alert("Already exists.");
-                        setPaymentMethods((arr) => [...arr, v]);
-                        setNewPayment("");
-                      }}
-                      style={{ background: "#1976d2", color: "white", border: "none", borderRadius: 6, padding: "6px 10px", cursor: "pointer" }}
+                      onClick={() => setPaymentMethods((arr) => arr.filter((x) => x !== p))}
+                      style={{ background: "#ef5350", color: "white", border: "none", borderRadius: 4, padding: "2px 6px", cursor: "pointer" }}
                     >
-                      Add
+                      ×
                     </button>
-                  </div>
-                  <ul>
-                    {paymentMethods.map((p) => (
-                      <li key={p} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-                        <span>{p}</span>
-                        <button
-                          onClick={() => setPaymentMethods((arr) => arr.filter((x) => x !== p))}
-                          style={{ background: "#ef5350", color: "white", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer" }}
-                        >
-                          Delete
-                        </button>
-                      </li>
-                    ))}
-                    {paymentMethods.length === 0 && <li style={{ color: dark ? "#bbb" : "#666" }}>No methods yet.</li>}
-                  </ul>
-                </div>
+                  </span>
+                ))}
               </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  placeholder="Add payment method"
+                  value={newPayment}
+                  onChange={(e) => setNewPayment(e.target.value)}
+                  style={{ flex: 1 }}
+                />
+                <button
+                  onClick={() => {
+                    const v = newPayment.trim();
+                    if (!v) return;
+                    if (paymentMethods.includes(v)) return alert("Payment method already exists.");
+                    setPaymentMethods((arr) => [...arr, v]);
+                    setNewPayment("");
+                  }}
+                  style={{ background: "#1976d2", color: "white", border: "none", borderRadius: 6, padding: "6px 10px", cursor: "pointer" }}
+                >
+                  Add
+                </button>
+              </div>
+            </div>
+          </div>
 
-              {/* ADMIN PINS */}
-              <div style={{ marginTop: 16, padding: 10, background: softBg, borderRadius: 6 }}>
-                <h3 style={{ marginTop: 0 }}>Admin PINs (change requires current PIN)</h3>
-                <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                  <thead>
-                    <tr>
-                      <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Admin</th>
-                      <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>PIN</th>
-                      <th style={{ borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {[1,2,3,4,5,6].map((n) => (
-                      <tr key={n}>
-                        <td style={{ padding: 6 }}>Admin {n}</td>
-                        <td style={{ padding: 6 }}>
-                          <input
-                            type="password"
-                            disabled={!adminPinsEditUnlocked[n]}
-                            value={adminPins[n] || ""}
-                            onChange={(e) => {
-                              const v = norm(e.target.value);
-                              setAdminPins((cur) => ({ ...cur, [n]: v }));
-                            }}
-                            style={{ width: 160 }}
-                          />
-                        </td>
-                        <td style={{ padding: 6 }}>
-                          {!adminPinsEditUnlocked[n] ? (
-                            <button
-                              onClick={() => {
-                                const entered = window.prompt(`Enter current PIN for Admin ${n} to unlock:`, "");
-                                if (entered == null) return;
-                                if (norm(entered) !== norm(adminPins[n])) {
-                                  alert("Wrong PIN.");
-                                  return;
-                                }
-                                setAdminPinsEditUnlocked((s) => ({ ...s, [n]: true }));
-                              }}
-                              style={{ background: "#1976d2", color: "white", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer" }}
-                            >
-                              Unlock Row
-                            </button>
-                          ) : (
-                            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                              <button
-                                onClick={() => setAdminPinsEditUnlocked((s) => ({ ...s, [n]: false }))}
-                                style={{ background: "#43a047", color: "white", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer" }}
-                              >
-                                Save & Lock
-                              </button>
-                            </div>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                <div style={{ marginTop: 6, color: dark ? "#bbb" : "#666", fontSize: 12 }}>
-                  Note: Editor PIN to open this tab is fixed to 0512.
-                </div>
-              </div>
-            </>
-          )}
+          {/* Admin PINs */}
+          <div style={{ marginTop: 16, padding: 10, background: softBg, borderRadius: 6 }}>
+            <h3 style={{ marginTop: 0 }}>Admin PINs (1–6)</h3>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Admin #</th>
+                  <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>PIN</th>
+                  <th style={{ borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[1,2,3,4,5,6].map((n) => (
+                  <tr key={n}>
+                    <td style={{ padding: 6 }}>Admin {n}</td>
+                    <td style={{ padding: 6 }}>
+                      <input
+                        type="password"
+                        value={adminPins[n] || ""}
+                        disabled={!adminPinsEditUnlocked[n]}
+                        onChange={(e) =>
+                          setAdminPins((p) => ({ ...p, [n]: e.target.value }))
+                        }
+                        style={{ width: 180 }}
+                      />
+                    </td>
+                    <td style={{ padding: 6 }}>
+                      {!adminPinsEditUnlocked[n] ? (
+                        <button
+                          onClick={() => {
+                            const ok = promptAdminAndPin();
+                            if (ok === n) {
+                              setAdminPinsEditUnlocked((s) => ({ ...s, [n]: true }));
+                            } else if (ok) {
+                              alert("You unlocked a different admin. Try again.");
+                            }
+                          }}
+                          style={{ background: "#1976d2", color: "white", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer" }}
+                        >
+                          Unlock row
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() =>
+                            setAdminPinsEditUnlocked((s) => ({ ...s, [n]: false }))
+                          }
+                          style={{ background: "#9e9e9e", color: "white", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer" }}
+                        >
+                          Lock row
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{ marginTop: 8, fontSize: 12, color: dark ? "#bbb" : "#666" }}>
+              Tip: To unlock a row, you must enter the current correct PIN for that Admin number.
+            </div>
+          </div>
         </div>
       )}
     </div>
   );
 }
+

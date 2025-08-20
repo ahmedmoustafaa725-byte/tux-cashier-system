@@ -8,6 +8,13 @@ import {
   onAuthStateChanged,
   auth,
 } from "./firebase";
+// FIREBASE SYNC — add at the top of App.js
+import { db } from "./firebase";
+import {
+  doc, setDoc, updateDoc, collection, addDoc, deleteDoc,
+  serverTimestamp, arrayUnion
+} from "firebase/firestore";
+
 
 // Must match the admin emails you created in Firebase Auth
 const ADMIN_EMAIL = (n) => `admin${n}@tux-pos.local`;

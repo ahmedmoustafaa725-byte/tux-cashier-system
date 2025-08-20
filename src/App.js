@@ -2603,4 +2603,3 @@ const printThermalTicket = async (order, widthMm = 58, copy = "Customer") => {
     </div>
   );
 }
-
